@@ -1,0 +1,118 @@
+name: FFmpeg (macOS)
+
+# Builds the ffmpeg/ffprobe pair that vendor/binaries.json pins for the two
+# macOS targets, from source, GPL and never --enable-nonfree.
+#
+# Run by hand, never on push: this produces the redistributable artefacts the
+# app ships, so publishing them is a decision, not a side effect of a commit.
+# The release tag is `media-binaries/<ffmpeg_tag>`, which deliberately does not
+# match `v*.*.*` and therefore cannot trigger .github/workflows/release.yml.
+#
+# After a run, pin the assets in vendor/binaries.json: the url is the asset's
+# browser_download_url, `archive` is "gz", and the sha256 is printed by the
+# release job (and attached as SHA256SUMS.txt). scripts/fetch-binaries.mjs
+# gunzips a "gz" entry straight into vendor/bin/<key>/, so the assets are the
+# bare executables, gzipped, named for the manifest key.
+on:
+  workflow_dispatch:
+    inputs:
+      ffmpeg_tag:
+        description: 'FFmpeg git tag to build (n7.1.x)'
+        required: true
+        default: 'n7.1.5'
+      publish:
+        description: 'Create/update the GitHub release for these artefacts'
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.key }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each architecture is built natively, so the build is also *run* and
+          # verified on the machine that made it — a cross-built x86_64 binary
+          # cannot be executed on an arm64 runner (hosted runners have no
+          # Rosetta). scripts/build-ffmpeg-macos.sh also handles the cross case:
+          # if the Intel runner label ever disappears, change this to
+          # `runner: macos-15` for both and the x86_64 leg keeps building, but
+          # its verification drops to `file`/`otool` only.
+          - arch: arm64
+            key: darwin-arm64
+            runner: macos-15
+          - arch: x86_64
+            key: darwin-x64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      # nasm is needed for x86_64 assembly (x264, x265, ffmpeg); automake and
+      # libtool because zimg publishes no configure script. The rest is on the
+      # image already, but naming them keeps the job honest if the image changes.
+      - name: Install build tools
+        run: brew install nasm automake libtool cmake pkgconf
+
+      - name: Build ffmpeg ${{ inputs.ffmpeg_tag }} for ${{ matrix.arch }}
+        run: ./scripts/build-ffmpeg-macos.sh "${{ matrix.arch }}" "${{ inputs.ffmpeg_tag }}" "$RUNNER_TEMP/out"
+
+      # The archive kind the fetcher understands: one gzipped executable per
+      # asset, named for the manifest key it belongs to.
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/assets"
+          for tool in ffmpeg ffprobe; do
+            gzip -9 -c "$RUNNER_TEMP/out/bin/$tool" > "$RUNNER_TEMP/assets/$tool-${{ matrix.key }}.gz"
+          done
+          cp "$RUNNER_TEMP/out/BUILD-INFO.txt"        "$RUNNER_TEMP/assets/BUILD-INFO-${{ matrix.key }}.txt"
+          cp "$RUNNER_TEMP/out/buildconf-ffmpeg.txt"  "$RUNNER_TEMP/assets/buildconf-ffmpeg-${{ matrix.key }}.txt"
+          cp "$RUNNER_TEMP/out/buildconf-ffprobe.txt" "$RUNNER_TEMP/assets/buildconf-ffprobe-${{ matrix.key }}.txt"
+          cp "$RUNNER_TEMP/out/COPYING.GPLv3"         "$RUNNER_TEMP/assets/COPYING.GPLv3"
+          # The hash the manifest pins is of the EXTRACTED executable, which is
+          # what scripts/binaries.mjs measures on disk — not of the .gz.
+          ( cd "$RUNNER_TEMP/out/bin" && shasum -a 256 ffmpeg ffprobe ) \
+            | sed 's|$| (${{ matrix.key }}, extracted)|' \
+            > "$RUNNER_TEMP/assets/SHA256SUMS-${{ matrix.key }}.txt"
+          cat "$RUNNER_TEMP/assets/SHA256SUMS-${{ matrix.key }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: media-binaries-${{ matrix.key }}
+          path: ${{ runner.temp }}/assets/
+          if-no-files-found: error
+
+  # Only when the operator asked for it. Everything above is reproducible and
+  # throwaway; this step is the one that puts bytes on a URL other machines will
+  # fetch forever.
+  release:
+    if: ${{ inputs.publish }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Publish media-binaries/${{ inputs.ffmpeg_tag }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: media-binaries/${{ inputs.ffmpeg_tag }}
+        run: |
+          set -euo pipefail
+          cat assets/SHA256SUMS-*.txt > assets/SHA256SUMS.txt
+          cat assets/SHA256SUMS.txt
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --title "ffmpeg ${{ inputs.ffmpeg_tag }} for macOS" \
+                 --notes "Static ffmpeg and ffprobe built from source by .github/workflows/ffmpeg-macos.yml, GPL-3.0-or-later, --enable-gpl --enable-version3, never --enable-nonfree. Pinned source revisions and the full configure line are in the BUILD-INFO and buildconf assets. Pin these in vendor/binaries.json with the sha256 of the EXTRACTED executable (SHA256SUMS.txt)."
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber assets/*
