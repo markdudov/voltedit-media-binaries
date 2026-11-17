@@ -1,6 +1,6 @@
-# SilenceTrimmer media binaries
+# VoltEdit media binaries
 
-Static **FFmpeg** builds that [SilenceTrimmer](https://silencetrimmer.com) vendors,
+Static **FFmpeg** builds that [VoltEdit](https://voltedit.com) vendors,
 together with the script that produces them.
 
 This repository exists so that the binaries the application ships, and the exact
@@ -9,7 +9,7 @@ the application.
 
 ## Why these are built rather than downloaded
 
-SilenceTrimmer needs `libx264`, `libx265` and **`libzimg`** — the last because its
+VoltEdit needs `libx264`, `libx265` and **`libzimg`** — the last because its
 HDR-to-SDR conversion is built on `zscale`, and a build without it fails at graph
 construction rather than at runtime.
 
